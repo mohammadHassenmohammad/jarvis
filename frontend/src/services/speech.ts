@@ -79,6 +79,49 @@ export function normalizeWhisperPhonetics(text: string): string {
   return cleaned;
 }
 
+// Adaptive Gap Calculator: Analyzes sentence completion and speech pacing
+export function calculateAdaptiveSilenceGap(
+  text: string,
+  isFinalChunk: boolean,
+  baseTimeoutMs: number = 1800
+): number {
+  const cleaned = text.trim();
+  if (!cleaned) return Math.max(1600, baseTimeoutMs);
+
+  const words = cleaned.toLowerCase().split(/\s+/);
+  const lastWord = words[words.length - 1].replace(/[^a-z]/g, '');
+
+  // Conjunctions, prepositions, and unfinished clause connectors:
+  // User is taking a breath or finding words -> provide generous gap so they are not cut off
+  const continuationWords = new Set([
+    'and', 'or', 'but', 'so', 'because', 'although', 'though', 'since',
+    'to', 'for', 'with', 'about', 'in', 'on', 'at', 'by', 'from', 'into', 'onto',
+    'that', 'which', 'who', 'whose', 'where', 'when', 'why', 'how', 'what',
+    'if', 'then', 'else', 'as', 'than',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had',
+    'the', 'a', 'an', 'my', 'your', 'his', 'her', 'their', 'our',
+    'like', 'also', 'actually', 'mean', 'plus', 'minus', 'such', 'well'
+  ]);
+
+  // If ends with comma, ellipsis, or connector word -> generous pause (2500ms)
+  if (cleaned.endsWith(',') || cleaned.endsWith('...') || continuationWords.has(lastWord)) {
+    return Math.max(2500, baseTimeoutMs + 700);
+  }
+
+  // If very short utterance (1-2 words), user is likely just beginning to speak -> allow generous gap (2200ms)
+  if (words.length <= 2) {
+    return Math.max(2200, baseTimeoutMs + 400);
+  }
+
+  // If terminal punctuation exists (. ? !) or final chunk reported, thought is syntactically closed
+  if (/[.?!]$/.test(cleaned) || isFinalChunk) {
+    return Math.max(1600, Math.min(baseTimeoutMs, 1800));
+  }
+
+  // Standard conversational sentence gap
+  return Math.max(1800, baseTimeoutMs);
+}
+
 export class SpeechService {
   private recognition: any = null;
   private currentMode: VoiceMode = 'idle';
@@ -89,6 +132,9 @@ export class SpeechService {
 
   // Speaker Echo-Gating & TTS Keep-Alive
   private isVocalizing = false;
+  private isMicLocked = false; // Master hardware lock: absolute microphone silence while speaking/thinking
+  private isRecognitionRunning = false; // Prevents duplicate concurrent recognition activations
+  private lastChimeTime = 0; // Prevents duplicate chime playback
   private ttsHeartbeat: any = null;
   private ttsSafetyWatcher: any = null;
 
@@ -130,6 +176,7 @@ export class SpeechService {
   private onInterruptCallback: (() => void) | null = null;
   private onContinuousSessionChangeCallback: ((active: boolean) => void) | null = null;
   private onContinuousTurnReadyCallback: (() => void) | null = null;
+  private onVocalizingChangeCallback: ((isSpeaking: boolean) => void) | null = null;
 
   constructor() {
     if (typeof navigator !== 'undefined' && navigator.language) {
@@ -162,7 +209,7 @@ export class SpeechService {
   }
 
   // --- Real-Time Hardware Microphone Stream (Audio Visualizer) ---
-  public async initMicStream() {
+  public async ensureMicrophoneAccess(): Promise<boolean> {
     try {
       if (!this.micStream) {
         this.micStream = await navigator.mediaDevices.getUserMedia({
@@ -174,6 +221,9 @@ export class SpeechService {
         });
 
         const ctx = this.getAudioContext();
+        if (ctx.state === 'suspended') {
+          await ctx.resume();
+        }
         const source = ctx.createMediaStreamSource(this.micStream);
         this.analyser = ctx.createAnalyser();
         this.analyser.fftSize = 64;
@@ -182,15 +232,24 @@ export class SpeechService {
 
         this.startMeterLoop();
       }
+      return true;
     } catch (e) {
-      console.warn('Mic stream initialization notice:', e);
+      console.warn('Microphone permission or stream access notice:', e);
+      return false;
     }
+  }
+
+  public async initMicStream() {
+    await this.ensureMicrophoneAccess();
   }
 
   private startMeterLoop() {
     if (this.animationFrameId) return;
     const bufferLength = this.analyser?.frequencyBinCount || 32;
     const dataArray = new Uint8Array(bufferLength);
+    let smoothedLevel = 0;
+    let lastDispatchedLevel = 0;
+    let lastDispatchTime = 0;
 
     const checkLevel = () => {
       if (this.analyser) {
@@ -200,13 +259,23 @@ export class SpeechService {
           sum += dataArray[i];
         }
         const avg = sum / bufferLength;
-        const normalized = Math.min(1.0, Math.max(0, avg / 128));
+        // Noise floor gate: discard ambient background floor (< 4)
+        const normalized = Math.min(1.0, Math.max(0, (avg - 4) / 120));
+        const target = (this.isVocalizing || this.isSpeakingNow() || this.isMicLocked) ? 0 : normalized;
 
-        // When JARVIS is vocalizing, mute visualizer so it doesn't bounce from its own voice
-        if (this.isVocalizing || this.isSpeakingNow()) {
-          this.audioLevelCallback?.(0);
-        } else {
-          this.audioLevelCallback?.(normalized);
+        // Smooth exponential attack/decay (eliminates high-frequency DOM jitter/glittering)
+        smoothedLevel = target > smoothedLevel
+          ? smoothedLevel * 0.45 + target * 0.55 // snappy attack
+          : smoothedLevel * 0.82 + target * 0.18; // smooth, cinematic decay
+
+        const now = performance.now();
+        // Dispatch at a stable ~25fps rate with a deadband threshold to stop DOM glittering
+        if (now - lastDispatchTime > 40) {
+          if (Math.abs(smoothedLevel - lastDispatchedLevel) > 0.02 || (smoothedLevel === 0 && lastDispatchedLevel !== 0)) {
+            lastDispatchedLevel = smoothedLevel;
+            lastDispatchTime = now;
+            this.audioLevelCallback?.(Number(smoothedLevel.toFixed(2)));
+          }
         }
       }
       this.animationFrameId = requestAnimationFrame(checkLevel);
@@ -275,58 +344,10 @@ export class SpeechService {
         if (!rawText) return;
         const lowerText = rawText.toLowerCase();
 
-        // 0. DUPLEX BARGE-IN (USER SPEAKS WHILE JARVIS IS VOCALIZING)
-        if (this.isVocalizing || this.isSpeakingNow()) {
-          if (this.interruptOnWake) {
-            const bargePattern =
-              /\b(hey|hi|ok|okay)?\s*(jarvis|javis|travis|service|jars|java|jobless|charvis|stop|cancel|halt|quiet|wait|hold on)\b/i;
-            const shouldBarge = this.isContinuousSessionActive
-              ? rawText.trim().length > 1
-              : bargePattern.test(lowerText);
-
-            if (shouldBarge) {
-              console.log('[VOICE_ENGINE] Duplex barge-in triggered! Halting vocalization.');
-              // 1. Immediately silence speech synthesis without dropping the user's spoken words
-              this.isVocalizing = false;
-              if (this.isSpeechSynthesisSupported()) {
-                window.speechSynthesis.cancel();
-              }
-              clearInterval(this.ttsHeartbeat);
-              this.ttsHeartbeat = null;
-              clearInterval(this.ttsSafetyWatcher);
-              this.ttsSafetyWatcher = null;
-              this.currentUtterance = null;
-              (window as any).__jarvis_active_utterance = null;
-              this.onInterruptCallback?.();
-
-              if (this.voiceFeedback) {
-                this.playChime('listen_start');
-              }
-
-              // 2. CRITICAL FIX: In Continuous Mode, keep whatever the user spoke right from the start!
-              // DO NOT advance startIndex or reset!
-              if (this.isContinuousSessionActive) {
-                this.currentMode = 'active_listening';
-                this.resetContinuousIdleTimer();
-                // Smoothly fall through into active_listening block below with full rawText intact!
-              } else {
-                const afterMatch = lowerText
-                  .replace(/.*?\b(jarvis|javis|travis|service|jars|java|jobless|charvis|stop|cancel|halt|quiet|wait)\b/i, '')
-                  .replace(/^[,:\s]+/, '')
-                  .trim();
-                this.startIndex = event.results ? event.results.length : 0;
-                this.wakeTriggeredThisTurn = true;
-                this.currentCapturedCommand = afterMatch;
-                this.onWakeActiveCallback?.();
-                return;
-              }
-            } else {
-              // Echo suppression: Ignore assistant's own minor audio reflections
-              return;
-            }
-          } else {
-            return;
-          }
+        // 0. ABSOLUTE GATE: When microphone is locked or JARVIS is vocalizing (speaking), DO NOT process microphone audio!
+        // As requested: "until the speech is not completed it should not listen me until I press ESC to stop it"
+        if (this.isMicrophoneLocked()) {
+          return;
         }
 
         // 1. ACTIVE COMMAND / CONTINUOUS CHATGPT VOICE MODE
@@ -349,7 +370,7 @@ export class SpeechService {
 
           // Strip any accidental leading wake words if user happened to say "Jarvis, what's..."
           const cleaned = rawText
-            .replace(/^(hey|hi|ok|okay)?\s*(jarvis|javis|travis|service|jars|java|jobless|charvis)[,:\s]*/i, '')
+            .replace(/^(hey|hi|hai|hay|ok|okay|hello|yo|wake\s*up|dear)?\s*(jarvis|jar\s*vis|jar\s*ves|javis|travis|service|services|starbucks|jars|java|jobless|charvis|darvis|javes|jarves|harvest)[,:\s]*/i, '')
             .trim();
 
           // Instant High-Precision Phonetic Normalization (Fayaz, Fowzia, ChatGPT, etc.)
@@ -358,11 +379,9 @@ export class SpeechService {
           this.currentCapturedCommand = displayCommand;
           this.onActiveLiveTranscriptCallback?.(displayCommand);
 
-          // Conversational Turn-Taking Silence Debounce
+          // Conversational Turn-Taking Adaptive Silence Debounce
           clearTimeout(this.silenceTimer);
-          const silenceDelay = isFinalChunk
-            ? Math.max(650, Math.floor(this.vadSilenceTimeout * 0.7))
-            : this.vadSilenceTimeout;
+          const silenceDelay = calculateAdaptiveSilenceGap(displayCommand, isFinalChunk, this.vadSilenceTimeout);
 
           this.silenceTimer = setTimeout(() => {
             const finalQuery = normalizeWhisperPhonetics(this.currentCapturedCommand || displayCommand).trim();
@@ -374,6 +393,10 @@ export class SpeechService {
               this.silenceTimer = null;
               if (finalQuery.length > 0 && callback) {
                 callback(finalQuery, true);
+              } else if (finalQuery.length === 0 && /\b(jarvis|jar\s*vis|jar\s*ves|javis|travis)\b/i.test(lowerText)) {
+                // If user in continuous mode simply said "Hey Jarvis", acknowledge gracefully
+                if (this.voiceFeedback) this.playChime('wake');
+                this.speak('Yes, Sir? I am listening.');
               }
             } else {
               this.stopActiveListening();
@@ -392,7 +415,7 @@ export class SpeechService {
         // 2. WAKE-WORD DETECTION MODE ("Hey Jarvis")
         if (this.currentMode === 'wake_word' && this.wakeWordEnabled) {
           const wakePattern =
-            /\b(hey|hi|ok|okay|wake up|yo|hello)?\s*(jarvis|javis|travis|service|jars|java|jobless|charvis)\b/i;
+            /\b(hey|hi|hai|hay|ok|okay|hello|yo|wake\s*up|dear|a|the)?\s*(jarvis|jar\s*vis|jar\s*ves|javis|travis|service|services|starbucks|jars|java|jobless|charvis|darvis|javes|jarves|harvest)\b/i;
 
           if (!this.wakeTriggeredThisTurn && wakePattern.test(lowerText)) {
             this.wakeTriggeredThisTurn = true;
@@ -418,7 +441,7 @@ export class SpeechService {
             clearTimeout(this.inactivityTimer);
 
             const match = lowerText.match(
-              /\b(jarvis|javis|travis|service|jars|java|jobless|charvis)\b/i
+              /\b(jarvis|jar\s*vis|jar\s*ves|javis|travis|service|services|starbucks|jars|java|jobless|charvis|darvis|javes|jarves|harvest)\b/i
             );
             let commandText = '';
             if (match && match.index !== undefined) {
@@ -426,7 +449,7 @@ export class SpeechService {
               commandText = rawText.slice(wakeEnd).replace(/^[,:\s]+/, '').trim();
             } else {
               commandText = rawText
-                .replace(/^(hey|hi|ok|okay)?\s*(jarvis|javis|travis|service|jars|java|jobless|charvis)[,:\s]*/i, '')
+                .replace(/^(hey|hi|hai|hay|ok|okay|hello|yo|wake\s*up|dear)?\s*(jarvis|jar\s*vis|jar\s*ves|javis|travis|service|services|starbucks|jars|java|jobless|charvis|darvis|javes|jarves|harvest)[,:\s]*/i, '')
                 .trim();
             }
 
@@ -435,9 +458,7 @@ export class SpeechService {
             this.onWakeLiveTranscriptCallback?.(normalizedCommand);
 
             clearTimeout(this.silenceTimer);
-            const silenceDelay = isFinalChunk
-              ? Math.max(700, Math.floor(this.vadSilenceTimeout * 0.75))
-              : this.vadSilenceTimeout;
+            const silenceDelay = calculateAdaptiveSilenceGap(normalizedCommand, isFinalChunk, this.vadSilenceTimeout);
 
             this.silenceTimer = setTimeout(() => {
               clearTimeout(this.maxRecordingTimer);
@@ -458,24 +479,35 @@ export class SpeechService {
         }
       };
 
+      this.recognition.onstart = () => {
+        this.isRecognitionRunning = true;
+      };
+
       this.recognition.onerror = (event: any) => {
         if (event.error === 'not-allowed') {
           this.onErrorCallback?.(
-            'Microphone access denied. Please grant microphone access in your browser.'
+            'Microphone access denied. Please click the Arc Reactor to grant microphone access.'
           );
         } else if (event.error === 'network') {
           console.warn('Speech recognition network glitch, reconnecting...');
+        } else if (event.error === 'no-speech') {
+          // Conversational silence pause - handled automatically by onend
         }
       };
 
       this.recognition.onend = () => {
+        this.isRecognitionRunning = false;
         this.startIndex = 0;
-        if (this.currentMode !== 'idle') {
-          clearTimeout(this.restartTimeout);
-          this.restartTimeout = setTimeout(() => {
-            this.safeStartRecognition();
-          }, 150);
+        // If microphone is locked, system is vocalizing, or mode is idle, DO NOT restart
+        if (this.isMicrophoneLocked() || this.currentMode === 'idle') {
+          return;
         }
+        clearTimeout(this.restartTimeout);
+        this.restartTimeout = setTimeout(() => {
+          if (!this.isMicrophoneLocked() && this.currentMode !== 'idle') {
+            this.safeStartRecognition();
+          }
+        }, 150);
       };
     } catch (e) {
       console.warn('Speech recognition initialization error:', e);
@@ -483,17 +515,25 @@ export class SpeechService {
   }
 
   public safeStartRecognition() {
-    if (this.currentMode === 'idle') return;
+    if (this.currentMode === 'idle' || this.isMicrophoneLocked()) return;
+    if (this.isRecognitionRunning && this.recognition) return;
+
     if (!this.recognition) {
       this.initRecognition();
     }
     try {
       this.recognition?.start();
+      this.isRecognitionRunning = true;
     } catch (e: any) {
       if (e?.name === 'InvalidStateError') {
+        // Recognition is already active in browser; flag running and do not recreate
+        this.isRecognitionRunning = true;
+      } else {
+        console.warn('[SPEECH] Error starting recognition, creating fresh session:', e);
         this.initRecognition();
         try {
           this.recognition?.start();
+          this.isRecognitionRunning = true;
         } catch {}
       }
     }
@@ -508,8 +548,7 @@ export class SpeechService {
     this.silenceTimer = null;
     this.inactivityTimer = null;
 
-    if (this.currentMode !== 'idle') {
-      this.initRecognition();
+    if (this.currentMode !== 'idle' && !this.isMicrophoneLocked()) {
       this.safeStartRecognition();
     }
   }
@@ -527,6 +566,15 @@ export class SpeechService {
   }
 
   public playChime(type: 'wake' | 'listen_start' | 'listen_stop') {
+    const nowMs = Date.now();
+    // Prevent duplicate listening start chimes within 1.8 seconds
+    if (type === 'listen_start' && nowMs - this.lastChimeTime < 1800) {
+      return;
+    }
+    if (type === 'listen_start') {
+      this.lastChimeTime = nowMs;
+    }
+
     try {
       const ctx = this.getAudioContext();
       const now = ctx.currentTime;
@@ -585,37 +633,88 @@ export class SpeechService {
     );
   }
 
+  // --- Master Microphone Lock Gate (Disables mic during speech and thinking) ---
+  public lockMicrophone(_reason?: string) {
+    this.isMicLocked = true;
+    this.isRecognitionRunning = false;
+    if (_reason) {
+      console.debug('[MIC_LOCK] Locked:', _reason);
+    }
+    clearTimeout(this.silenceTimer);
+    clearTimeout(this.inactivityTimer);
+    clearTimeout(this.restartTimeout);
+    this.silenceTimer = null;
+    this.inactivityTimer = null;
+    this.restartTimeout = null;
+    this.currentCapturedCommand = '';
+    try {
+      if (this.recognition) {
+        this.recognition.onstart = null;
+        this.recognition.onresult = null;
+        this.recognition.onerror = null;
+        this.recognition.onend = null;
+        try {
+          this.recognition.abort();
+        } catch {}
+        this.recognition = null;
+      }
+    } catch {}
+  }
+
+  public unlockMicrophone() {
+    this.isMicLocked = false;
+    this.isVocalizing = false;
+    this.isRecognitionRunning = false;
+  }
+
+  public isMicrophoneLocked(): boolean {
+    return this.isMicLocked || this.isVocalizing || !!this.currentUtterance;
+  }
+
   // --- Voice Synthesis (TTS) with Echo-Shielding and Chromium Keep-Alive ---
   public stopSpeaking() {
     clearInterval(this.ttsHeartbeat);
-    clearInterval(this.ttsSafetyWatcher);
+    clearTimeout(this.ttsSafetyWatcher);
     this.ttsHeartbeat = null;
     this.ttsSafetyWatcher = null;
-    this.isVocalizing = false;
     this.currentUtterance = null;
     (window as any).__jarvis_active_utterance = null;
 
     if (this.isSpeechSynthesisSupported()) {
-      window.speechSynthesis.cancel();
+      try {
+        window.speechSynthesis.cancel();
+      } catch {}
     }
 
-    if (this.isContinuousSessionActive) {
-      this.currentMode = 'active_listening';
+    this.isVocalizing = false;
+    this.isMicLocked = false;
+    this.isRecognitionRunning = false;
+    this.onVocalizingChangeCallback?.(false);
+    this.onInterruptCallback?.();
+
+    // Immediately resume listening after interruption!
+    // As requested: "until I press esc to stop it once it gets over again it start listen to me"
+    setTimeout(() => {
+      this.currentMode = this.isContinuousSessionActive ? 'active_listening' : (this.wakeWordEnabled ? 'wake_word' : 'idle');
       this.wakeTriggeredThisTurn = false;
       this.currentCapturedCommand = '';
       this.startIndex = 0;
-      setTimeout(() => {
-        this.safeStartRecognition();
-      }, 100);
-    } else if (this.wakeWordEnabled || this.currentMode !== 'idle') {
-      setTimeout(() => {
-        this.safeStartRecognition();
-      }, 100);
-    }
+      if (this.isContinuousSessionActive) {
+        this.resetContinuousIdleTimer();
+      }
+      this.safeStartRecognition();
+      if (this.voiceFeedback) {
+        this.playChime('listen_start');
+      }
+    }, 120);
+  }
+
+  public setOnVocalizingChange(cb: ((isSpeaking: boolean) => void) | null) {
+    this.onVocalizingChangeCallback = cb;
   }
 
   public isSpeakingNow(): boolean {
-    return !!(window.speechSynthesis && (window.speechSynthesis.speaking || this.currentUtterance));
+    return this.isVocalizing || !!this.currentUtterance;
   }
 
   public getAvailableVoices(): VoiceOption[] {
@@ -655,10 +754,14 @@ export class SpeechService {
       .replace(/SYSTEM TOOL EXECUTION REPORT/g, '')
       .trim();
 
-    if (!cleanText) return;
+    if (!cleanText) {
+      this.unlockMicrophone();
+      options?.onEnd?.();
+      return;
+    }
 
     clearInterval(this.ttsHeartbeat);
-    clearInterval(this.ttsSafetyWatcher);
+    clearTimeout(this.ttsSafetyWatcher);
 
     try {
       if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
@@ -672,12 +775,20 @@ export class SpeechService {
       } catch {}
     }
 
+    // LOCK MICROPHONE COMPLETELY: System is vocalizing through speakers
+    this.lockMicrophone('TTS speech vocalization starting');
     this.isVocalizing = true;
+    this.onVocalizingChangeCallback?.(true);
     const ttsStartTime = Date.now();
 
+    const words = cleanText.split(/\s+/).filter(Boolean).length;
+    const rate = options?.rate || 1.02;
+    // Average speech pace: ~135 words/minute at 1.0x -> ~440ms per word + 600ms base padding
+    const estimatedDurationMs = Math.max(1800, Math.round((words * 440) / rate) + 600);
+
     const utterance = new SpeechSynthesisUtterance(cleanText);
-    utterance.rate = options?.rate || 1.05;
-    utterance.pitch = options?.pitch || 0.95;
+    utterance.rate = rate;
+    utterance.pitch = options?.pitch || 0.98;
 
     const voices = window.speechSynthesis.getVoices();
     let selectedVoice: SpeechSynthesisVoice | undefined;
@@ -731,61 +842,80 @@ export class SpeechService {
     let vocalizingFinished = false;
     const finishVocalizing = () => {
       if (vocalizingFinished) return;
+
+      // Failsafe: if speechSynthesis is still reporting speaking, extend by 350ms
+      if (window.speechSynthesis && window.speechSynthesis.speaking) {
+        setTimeout(() => {
+          vocalizingFinished = false;
+          finishVocalizing();
+        }, 350);
+        return;
+      }
+
       vocalizingFinished = true;
       clearInterval(this.ttsHeartbeat);
-      clearInterval(this.ttsSafetyWatcher);
+      clearTimeout(this.ttsSafetyWatcher);
+      this.ttsHeartbeat = null;
+      this.ttsSafetyWatcher = null;
       this.currentUtterance = null;
       (window as any).__jarvis_active_utterance = null;
 
-      // Allow 250ms for room echo to dissipate before unmuting mic
+      // Clean 500ms acoustic dissipation cooldown to ensure speakers are 100% silent
+      // and room echo has cleared before the mic opens
       setTimeout(() => {
         this.isVocalizing = false;
+        this.isMicLocked = false;
+        this.currentMode = this.isContinuousSessionActive ? 'active_listening' : (this.wakeWordEnabled ? 'wake_word' : 'idle');
+        this.wakeTriggeredThisTurn = false;
+        this.currentCapturedCommand = '';
+        this.startIndex = 0;
         if (this.isContinuousSessionActive) {
-          this.currentMode = 'active_listening';
-          this.wakeTriggeredThisTurn = false;
-          this.currentCapturedCommand = '';
-          this.startIndex = 0;
           this.resetContinuousIdleTimer();
-          this.safeStartRecognition();
-          this.onContinuousTurnReadyCallback?.();
-        } else if (this.wakeWordEnabled || this.currentMode !== 'idle') {
-          this.currentMode = 'wake_word';
-          this.wakeTriggeredThisTurn = false;
-          this.currentCapturedCommand = '';
-          this.startIndex = 0;
-          this.safeStartRecognition();
         }
-      }, 250);
+        this.safeStartRecognition();
+
+        this.onVocalizingChangeCallback?.(false);
+        if (this.isContinuousSessionActive) {
+          this.onContinuousTurnReadyCallback?.();
+        }
+        if (this.voiceFeedback && this.isContinuousSessionActive) {
+          this.playChime('listen_start');
+        }
+        options?.onEnd?.();
+      }, 500);
     };
 
-    // Chromium TTS Safety Watcher: Check only after at least 1500ms have elapsed
-    // so we never falsely terminate during initial audio stream initialization
-    clearInterval(this.ttsSafetyWatcher);
-    this.ttsSafetyWatcher = setInterval(() => {
-      const elapsed = Date.now() - ttsStartTime;
-      if (
-        elapsed > 1500 &&
-        !window.speechSynthesis.speaking &&
-        !window.speechSynthesis.pending &&
-        this.isVocalizing
-      ) {
-        clearInterval(this.ttsSafetyWatcher);
+    // Watchdog Failsafe: Only triggers if onend never fired and a massive timeout has passed
+    clearTimeout(this.ttsSafetyWatcher);
+    this.ttsSafetyWatcher = setTimeout(() => {
+      if (this.isVocalizing) {
+        console.warn('[SPEECH] Watchdog timer elapsed; releasing vocalizing lock.');
         finishVocalizing();
-        options?.onEnd?.();
       }
-    }, 500);
+    }, Math.max(12000, estimatedDurationMs * 2 + 5000));
 
     utterance.onstart = () => {
       this.isVocalizing = true;
+      this.isMicLocked = true;
       options?.onStart?.();
     };
 
     utterance.onend = () => {
-      finishVocalizing();
-      options?.onEnd?.();
+      const elapsed = Date.now() - ttsStartTime;
+      // In some versions of Chromium on Windows, onend can fire prematurely if the utterance was chunked.
+      // If elapsed time is significantly less than minimum physical speech duration, wait out the remaining duration:
+      const remainingMs = Math.max(0, (estimatedDurationMs * 0.8) - elapsed);
+      if (remainingMs > 200) {
+        setTimeout(() => {
+          finishVocalizing();
+        }, remainingMs);
+      } else {
+        finishVocalizing();
+      }
     };
 
     utterance.onerror = (e) => {
+      console.warn('[SPEECH] SpeechSynthesis error:', e);
       finishVocalizing();
       options?.onError?.(e);
     };
@@ -803,15 +933,20 @@ export class SpeechService {
   ) {
     this.wakeWordEnabled = true;
     this.currentMode = 'wake_word';
+    this.isMicLocked = false;
+    this.isVocalizing = false;
     this.wakeTriggeredThisTurn = false;
     this.currentCapturedCommand = '';
+    this.startIndex = 0;
     this.onWakeWordCallback = onWakeWordDetected;
     this.onWakeWordOnlyCallback = onWakeWordOnly;
     this.onWakeActiveCallback = onWakeActive;
     this.onWakeLiveTranscriptCallback = onLiveTranscript;
     this.onErrorCallback = onError || null;
     this.initMicStream();
-    this.initRecognition();
+    if (!this.recognition) {
+      this.initRecognition();
+    }
     this.safeStartRecognition();
   }
 
@@ -955,6 +1090,10 @@ export class SpeechService {
     this.interruptOnWake = enabled;
   }
 
+  public getInterruptOnWake(): boolean {
+    return this.interruptOnWake;
+  }
+
   public setMaxRecordingDuration(seconds: number) {
     if (seconds > 5) {
       this.maxRecordingDuration = seconds;
@@ -995,7 +1134,9 @@ export class SpeechService {
     }
     this.resetContinuousIdleTimer();
     this.initMicStream();
-    this.initRecognition();
+    if (!this.recognition) {
+      this.initRecognition();
+    }
     this.safeStartRecognition();
   }
 

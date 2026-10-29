@@ -21,8 +21,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSave,
   onRefreshHealth,
 }) => {
-  const [model, setModel] = useState('jarvis:latest');
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [model, setModel] = useState('jarvis-latest-fast');
+  const [availableModels, setAvailableModels] = useState<string[]>(['jarvis-latest-fast']);
   const [systemPrompt, setSystemPrompt] = useState('');
   const [memoryEnabled, setMemoryEnabled] = useState(true);
   const [voiceAutoSpeak, setVoiceAutoSpeak] = useState(true);
@@ -105,17 +105,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      api.getOllamaModels().then((models) => {
-        const fastModels = models.filter((m) => !m.includes('qwen3') && !m.includes('instant'));
-        if (fastModels.length > 0) {
-          setAvailableModels(fastModels);
-          if (!model || model.includes('qwen3')) {
-            setModel(fastModels[0]);
-          }
-        } else {
-          setAvailableModels(['jarvis:latest', 'jarvis-fast:latest', 'qwen2.5:1.5b']);
-        }
-      });
+      setAvailableModels(['jarvis-latest-fast']);
+      setModel('jarvis-latest-fast');
 
       // Load installed browser speech synthesis voices
       const voices = speechService.getAvailableVoices();

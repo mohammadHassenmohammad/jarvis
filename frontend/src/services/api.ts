@@ -221,6 +221,7 @@ export const api = {
       onStatus?: (status: string) => void;
       onError: (err: string) => void;
       onDone: () => void;
+      onConversationId?: (id: string) => void;
     }
   ) {
     try {
@@ -241,6 +242,11 @@ export const api = {
         const errText = await response.text();
         callbacks.onError(`HTTP Error ${response.status}: ${errText}`);
         return;
+      }
+
+      const serverConvId = response.headers.get('X-Conversation-Id');
+      if (serverConvId && callbacks.onConversationId) {
+        callbacks.onConversationId(serverConvId);
       }
 
       const reader = response.body?.getReader();

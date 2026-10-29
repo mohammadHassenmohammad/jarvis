@@ -13,9 +13,11 @@ from .system_tools import (
     terminate_app,
     update_memory_tool,
     delete_memory_tool,
+    forget_memory_tool,
     search_memories_tool,
     search_past_conversations_tool,
     trigger_n8n_webhook,
+    summarize_conversation_tool,
 )
 
 TOOL_DEFINITIONS = [
@@ -277,6 +279,23 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "forget_memory",
+            "description": "Forget or remove a specific user preference, fact, or memory matching a phrase or keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The fact, preference, or topic to forget."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_memories",
             "description": "Search the persistent memory vault for saved user preferences, habits, or past recorded facts.",
             "parameters": {
@@ -354,8 +373,10 @@ TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "save_memory": lambda fact="", category="user_preference", **kw: save_memory_tool(fact=fact, category=category),
     "update_memory": lambda memory_id="", content="", category=None, **kw: update_memory_tool(memory_id=memory_id, content=content, category=category),
     "delete_memory": lambda memory_id="", **kw: delete_memory_tool(memory_id=memory_id),
+    "forget_memory": lambda query="", **kw: forget_memory_tool(query=query),
     "search_memories": lambda query="", category=None, **kw: search_memories_tool(query=query, category=category),
     "search_past_conversations": lambda query="", limit=4, **kw: search_past_conversations_tool(query=query, limit=limit),
+    "summarize_conversation": lambda conversation_id="", **kw: summarize_conversation_tool(conversation_id=conversation_id),
     "trigger_n8n_webhook": lambda workflow_name="default", payload=None, **kw: trigger_n8n_webhook(workflow_name=workflow_name, payload=payload),
     "silence_output": lambda **kw: {"success": True, "message": "Voice silenced and standing by."},
 }

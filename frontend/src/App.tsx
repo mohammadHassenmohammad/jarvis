@@ -9,11 +9,28 @@ import { ChatInput } from './components/ChatInput';
 import { QuickTools } from './components/QuickTools';
 import { SettingsModal } from './components/SettingsModal';
 import { MemoryManager } from './components/MemoryManager';
-import { Clock, Wifi, WifiOff, Menu, Cpu, CheckCircle, Cloud } from 'lucide-react';
+import { Clock, Wifi, WifiOff, Menu, Cpu, CheckCircle, Cloud, Mic } from 'lucide-react';
 
 export const App: React.FC = () => {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const activeConversationIdRef = useRef<string | null>(null);
+  const handleSendMessageRef = useRef<(text: string) => Promise<void>>(() => Promise.resolve());
+
+  const updateActiveConversationId = (id: string | null) => {
+    activeConversationIdRef.current = id;
+    setActiveConversationId(id);
+    if (id) {
+      try {
+        localStorage.setItem('jarvis_active_session_id', id);
+      } catch {}
+    } else {
+      try {
+        localStorage.removeItem('jarvis_active_session_id');
+      } catch {}
+    }
+  };
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [assistantState, setAssistantState] = useState<AssistantState>('idle');
@@ -28,13 +45,13 @@ export const App: React.FC = () => {
   const [audioLevel, setAudioLevel] = useState(0);
   const [wakeWordActive, setWakeWordActive] = useState(false);
   const [isContinuousVoiceActive, setIsContinuousVoiceActive] = useState(false);
+  const [micPermissionNeeded, setMicPermissionNeeded] = useState(false);
 
   // System & Telemetry States
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   const [ollamaHealth, setOllamaHealth] = useState<OllamaHealth | null>(null);
   const [currentTimeStr, setCurrentTimeStr] = useState('');
-  const [availableModels, setAvailableModels] = useState<string[]>(['jarvis:latest', 'jarvis-fast:latest', 'qwen2.5:1.5b']);
   const [modelToast, setModelToast] = useState<string | null>(null);
 
   // UI Modal States
@@ -55,12 +72,47 @@ export const App: React.FC = () => {
     return () => clearInterval(timer);
   }, []);
 
-  // Initialize backend data
+  // Initialize backend data & audio sensors
   useEffect(() => {
     loadInitialData();
     const interval = setInterval(refreshTelemetry, 8000);
-    return () => clearInterval(interval);
+
+    // Immediate check: if mic permission is already granted, activate recognition right away
+    speechService.ensureMicrophoneAccess().then((ok) => {
+      if (ok) {
+        setMicPermissionNeeded(false);
+        speechService.safeStartRecognition();
+      }
+    });
+
+    const handleFirstInteraction = () => {
+      speechService.ensureMicrophoneAccess().then((ok) => {
+        if (ok) {
+          setMicPermissionNeeded(false);
+          speechService.safeStartRecognition();
+        }
+      });
+      window.removeEventListener('pointerdown', handleFirstInteraction);
+    };
+    window.addEventListener('pointerdown', handleFirstInteraction);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('pointerdown', handleFirstInteraction);
+    };
   }, []);
+
+  const activateMicrophone = async () => {
+    const granted = await speechService.ensureMicrophoneAccess();
+    if (granted) {
+      setMicPermissionNeeded(false);
+      speechService.safeStartRecognition();
+      setModelToast('AUDIO SENSORS ONLINE // LISTENING FOR "HEY JARVIS"');
+      setTimeout(() => setModelToast(null), 3000);
+    } else {
+      setMicPermissionNeeded(true);
+    }
+  };
 
   // Auto-scroll messages
   useEffect(() => {
@@ -69,10 +121,7 @@ export const App: React.FC = () => {
 
   const loadInitialData = async () => {
     try {
-      const [s, modelList] = await Promise.all([
-        api.getSettings(),
-        api.getOllamaModels().catch(() => []),
-      ]);
+      const s = await api.getSettings();
       setSettings(s);
       if (s?.voice_input_mode) {
         setVoiceInputMode(s.voice_input_mode as any);
@@ -80,15 +129,19 @@ export const App: React.FC = () => {
       if (s?.wake_word_enabled) {
         setWakeWordActive(s.wake_word_enabled === 'true');
       }
-      const fastModels = modelList.filter((m: string) => !m.includes('qwen3') && !m.includes('instant'));
-      if (fastModels.length > 0) {
-        setAvailableModels(fastModels);
-      }
       refreshTelemetry();
       const convs = await api.getConversations();
       setConversations(convs);
 
-      if (convs.length > 0) {
+      let savedSessionId: string | null = null;
+      try {
+        savedSessionId = localStorage.getItem('jarvis_active_session_id');
+      } catch {}
+
+      const matchedConv = savedSessionId ? convs.find((c) => c.id === savedSessionId) : null;
+      if (matchedConv) {
+        selectConversation(matchedConv.id);
+      } else if (convs.length > 0) {
         selectConversation(convs[0].id);
       } else {
         startNewConversation();
@@ -100,22 +153,17 @@ export const App: React.FC = () => {
 
   const refreshTelemetry = async () => {
     try {
-      const [health, status, modelList] = await Promise.all([
+      const [health, status] = await Promise.all([
         api.getOllamaStatus(),
         api.getSystemStatus(),
-        api.getOllamaModels().catch(() => []),
       ]);
       setOllamaHealth(health);
       setSystemStatus(status);
-      const fastModels = modelList.filter((m: string) => !m.includes('qwen3') && !m.includes('instant'));
-      if (fastModels.length > 0) {
-        setAvailableModels(fastModels);
-      }
     } catch {}
   };
 
   const selectConversation = async (id: string) => {
-    setActiveConversationId(id);
+    updateActiveConversationId(id);
     try {
       const data = await api.getConversation(id);
       setMessages(data.messages || []);
@@ -127,8 +175,8 @@ export const App: React.FC = () => {
   const startNewConversation = async () => {
     try {
       const newConv = await api.createConversation('New Protocol Session');
-      setConversations([newConv, ...conversations]);
-      setActiveConversationId(newConv.id);
+      updateActiveConversationId(newConv.id);
+      setConversations((prev) => [newConv, ...prev.filter((c) => c.id !== newConv.id)]);
       setMessages([]);
     } catch (e) {
       console.error('Failed to create new conversation:', e);
@@ -140,7 +188,7 @@ export const App: React.FC = () => {
       await api.deleteConversation(id);
       const remaining = conversations.filter((c) => c.id !== id);
       setConversations(remaining);
-      if (activeConversationId === id) {
+      if (activeConversationIdRef.current === id) {
         if (remaining.length > 0) {
           selectConversation(remaining[0].id);
         } else {
@@ -168,12 +216,17 @@ export const App: React.FC = () => {
   const handleSendMessage = async (text: string) => {
     if (!text.trim() || isLoading) return;
 
-    let targetConvId = activeConversationId;
+    let targetConvId = activeConversationIdRef.current;
     if (!targetConvId) {
-      const newConv = await api.createConversation(text.slice(0, 30));
-      targetConvId = newConv.id;
-      setActiveConversationId(targetConvId);
-      setConversations([newConv, ...conversations]);
+      try {
+        const newConv = await api.createConversation(text.slice(0, 30));
+        targetConvId = newConv.id;
+        updateActiveConversationId(targetConvId);
+        setConversations((prev) => [newConv, ...prev.filter((c) => c.id !== newConv.id)]);
+      } catch (e) {
+        console.error('Failed to create session for prompt:', e);
+        return;
+      }
     }
 
     const userMsg: Message = {
@@ -183,6 +236,8 @@ export const App: React.FC = () => {
       created_at: new Date().toISOString(),
     };
 
+    // Lock microphone immediately while waiting for reasoning, tool execution, and speech output
+    speechService.lockMicrophone('User message dispatched; awaiting assistant response');
     setSpeechTranscript('');
     setIsListening(false);
 
@@ -207,6 +262,11 @@ export const App: React.FC = () => {
     const activeModel = currentActiveModel;
 
     await api.streamChat(targetConvId, text, activeModel, {
+      onConversationId: (returnedId) => {
+        if (returnedId && activeConversationIdRef.current !== returnedId) {
+          updateActiveConversationId(returnedId);
+        }
+      },
       onStatus: (status) => {
         if (status === 'thinking') setAssistantState('thinking');
         else if (status === 'speaking') setAssistantState('speaking');
@@ -242,7 +302,7 @@ export const App: React.FC = () => {
         const toolMsg: Message = {
           id: `tool-${Date.now()}`,
           role: 'tool',
-          content: result.message || JSON.stringify(result),
+          content: result.message || (result.error ? `System Error: ${result.error}` : JSON.stringify(result)),
           tool_results: [{ tool: toolName, result }],
           created_at: new Date().toISOString(),
         };
@@ -250,12 +310,13 @@ export const App: React.FC = () => {
       },
       onChunk: (chunk) => {
         accumulatedContent += chunk;
-        setAssistantState('speaking');
+        setAssistantState('thinking');
         setMessages((prev) =>
           prev.map((m) => (m.id === assistantMsgId ? { ...m, content: accumulatedContent } : m))
         );
       },
       onError: (err) => {
+        speechService.unlockMicrophone();
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMsgId
@@ -267,6 +328,9 @@ export const App: React.FC = () => {
         setAssistantState('error');
         setTimeout(() => {
           setAssistantState(wakeWordActive ? 'wake_word_monitoring' : 'idle');
+          if (wakeWordActive) {
+            speechService.safeStartRecognition();
+          }
         }, 3000);
       },
       onDone: () => {
@@ -277,6 +341,7 @@ export const App: React.FC = () => {
         const autoSpeak = settings?.voice_auto_speak !== 'false';
         if (autoSpeak && accumulatedContent && !isMuted) {
           setIsSpeaking(true);
+          setIsListening(false);
           setAssistantState('speaking');
           speechService.speak(accumulatedContent, {
             rate: parseFloat(settings?.speech_rate || '1.05'),
@@ -284,39 +349,26 @@ export const App: React.FC = () => {
             preferredVoice: settings?.preferred_voice,
             onStart: () => {
               setIsSpeaking(true);
+              setIsListening(false);
               setAssistantState('speaking');
             },
             onEnd: () => {
               setIsSpeaking(false);
               setSpeechTranscript('');
-              if (speechService.isContinuousSession()) {
-                setIsListening(true);
-                setAssistantState('listening');
-              } else {
-                const wakeOn = settings?.wake_word_enabled !== 'false';
-                setAssistantState(wakeOn ? 'wake_word_monitoring' : 'idle');
-                if (wakeOn) {
-                  speechService.safeStartRecognition();
-                }
-              }
+              // Always resume listening immediately once speech and acoustic dissipation are complete
+              setIsListening(true);
+              setAssistantState('listening');
             },
             onError: (err) => {
               console.warn('TTS playback notice:', err);
               setIsSpeaking(false);
               setSpeechTranscript('');
-              if (speechService.isContinuousSession()) {
-                setIsListening(true);
-                setAssistantState('listening');
-              } else {
-                const wakeOn = settings?.wake_word_enabled !== 'false';
-                setAssistantState(wakeOn ? 'wake_word_monitoring' : 'idle');
-                if (wakeOn) {
-                  speechService.safeStartRecognition();
-                }
-              }
+              setIsListening(true);
+              setAssistantState('listening');
             },
           });
         } else {
+          speechService.unlockMicrophone();
           setSpeechTranscript('');
           if (speechService.isContinuousSession()) {
             setIsListening(true);
@@ -335,6 +387,10 @@ export const App: React.FC = () => {
     });
   };
 
+  useEffect(() => {
+    handleSendMessageRef.current = handleSendMessage;
+  });
+
   // Continuous Wake-Word Detection & Live Grasping Lifecycle
   useEffect(() => {
     const isEnabled = settings?.wake_word_enabled !== 'false';
@@ -352,10 +408,27 @@ export const App: React.FC = () => {
       setIsContinuousVoiceActive(active);
     });
 
+    speechService.setOnVocalizingChange((speaking) => {
+      setIsSpeaking(speaking);
+      if (speaking) {
+        setIsListening(false);
+        setAssistantState('speaking');
+      } else {
+        if (speechService.isContinuousSession()) {
+          setIsListening(true);
+          setAssistantState('listening');
+        } else {
+          setAssistantState(isEnabled ? 'wake_word_monitoring' : 'idle');
+        }
+      }
+    });
+
     speechService.setOnContinuousTurnReady(() => {
-      setIsListening(true);
-      setAssistantState('listening');
-      setSpeechTranscript('');
+      if (!speechService.isSpeakingNow()) {
+        setIsListening(true);
+        setAssistantState('listening');
+        setSpeechTranscript('');
+      }
     });
 
     speechService.setOnInterrupt(() => {
@@ -394,7 +467,7 @@ export const App: React.FC = () => {
               (nextCmd, isFinal) => {
                 setSpeechTranscript(nextCmd);
                 if (isFinal && nextCmd.trim()) {
-                  handleSendMessage(nextCmd.trim());
+                  handleSendMessageRef.current(nextCmd.trim());
                   setSpeechTranscript('');
                   setIsListening(false);
                   setAssistantState('thinking');
@@ -415,7 +488,7 @@ export const App: React.FC = () => {
             setSpeechTranscript('');
             setIsListening(false);
             setAssistantState('thinking');
-            handleSendMessage(command);
+            handleSendMessageRef.current(command);
           }, 150);
         },
         // 2. Only wake word spoken ("Hey Jarvis" without immediate question)
@@ -434,7 +507,7 @@ export const App: React.FC = () => {
                 (cmd, isFinal) => {
                   setSpeechTranscript(cmd);
                   if (isFinal && cmd.trim()) {
-                    handleSendMessage(cmd.trim());
+                    handleSendMessageRef.current(cmd.trim());
                     setSpeechTranscript('');
                     setIsListening(false);
                     setAssistantState('thinking');
@@ -451,7 +524,7 @@ export const App: React.FC = () => {
                 (cmd, isFinal) => {
                   setSpeechTranscript(cmd);
                   if (isFinal && cmd.trim()) {
-                    handleSendMessage(cmd.trim());
+                    handleSendMessageRef.current(cmd.trim());
                     setSpeechTranscript('');
                     setIsListening(false);
                     setAssistantState('thinking');
@@ -501,7 +574,12 @@ export const App: React.FC = () => {
           setIsListening(true);
           setAssistantState('listening');
         },
-        (err) => console.warn('Wake-word engine notice:', err)
+        (err) => {
+          console.warn('Wake-word engine notice:', err);
+          if (err && err.toLowerCase().includes('micro')) {
+            setMicPermissionNeeded(true);
+          }
+        }
       );
     } else {
       speechService.setWakeWordEnabled(false);
@@ -531,7 +609,7 @@ export const App: React.FC = () => {
       (transcript, isFinal) => {
         setSpeechTranscript(transcript);
         if (isFinal && transcript.trim()) {
-          handleSendMessage(transcript.trim());
+          handleSendMessageRef.current(transcript.trim());
           setSpeechTranscript('');
           setIsListening(false);
           setAssistantState('idle');
@@ -554,7 +632,7 @@ export const App: React.FC = () => {
   const handleStopPushToTalk = () => {
     speechService.stopPushToTalk();
     if (speechTranscript.trim()) {
-      handleSendMessage(speechTranscript.trim());
+      handleSendMessageRef.current(speechTranscript.trim());
       setSpeechTranscript('');
     }
     setIsListening(false);
@@ -597,7 +675,7 @@ export const App: React.FC = () => {
       (cmd, isFinal) => {
         setSpeechTranscript(cmd);
         if (isFinal && cmd.trim()) {
-          handleSendMessage(cmd.trim());
+          handleSendMessageRef.current(cmd.trim());
           setSpeechTranscript('');
           setIsListening(false);
           setAssistantState('thinking');
@@ -630,8 +708,11 @@ export const App: React.FC = () => {
         if (speechService.isSpeakingNow()) {
           speechService.stopSpeaking();
           setIsSpeaking(false);
-          setModelToast('VOCALIZATION HALTED');
+          setIsListening(true);
+          setAssistantState('listening');
+          setModelToast('VOCALIZATION HALTED [ESC] // LISTENING');
           setTimeout(() => setModelToast(null), 2000);
+          return;
         }
         if (speechService.isContinuousSession()) {
           stopContinuousVoiceMode('user_action');
@@ -647,6 +728,7 @@ export const App: React.FC = () => {
     // Interruption: silence any ongoing speech immediately
     speechService.interrupt();
     setIsSpeaking(false);
+    activateMicrophone();
 
     // If continuous mode is running, clicking Arc Reactor deactivates it:
     if (speechService.isContinuousSession()) {
@@ -657,7 +739,7 @@ export const App: React.FC = () => {
     if (isListening) {
       speechService.stopActiveListening();
       if (speechTranscript.trim()) {
-        handleSendMessage(speechTranscript.trim());
+        handleSendMessageRef.current(speechTranscript.trim());
         setSpeechTranscript('');
       }
       setIsListening(false);
@@ -672,7 +754,7 @@ export const App: React.FC = () => {
           (transcript, isFinal) => {
             setSpeechTranscript(transcript);
             if (isFinal && transcript.trim()) {
-              handleSendMessage(transcript.trim());
+              handleSendMessageRef.current(transcript.trim());
               setSpeechTranscript('');
               speechService.stopActiveListening();
               setIsListening(false);
@@ -724,7 +806,7 @@ export const App: React.FC = () => {
     setTimeout(() => setModelToast(null), 3500);
   };
 
-  const currentActiveModel = settings?.model || availableModels[0] || 'jarvis:latest';
+  const currentActiveModel = 'jarvis-latest-fast';
 
   return (
     <div style={{ display: 'flex', width: '100vw', height: '100vh', overflow: 'hidden' }}>
@@ -944,14 +1026,47 @@ export const App: React.FC = () => {
           </div>
         )}
 
+        {/* Microphone Permission Required Notification Banner */}
+        {micPermissionNeeded && (
+          <div
+            onClick={activateMicrophone}
+            title="Click to initialize microphone sensors"
+            style={{
+              position: 'absolute',
+              top: '64px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 100,
+              background: 'rgba(239, 68, 68, 0.25)',
+              border: '1px solid #ef4444',
+              boxShadow: '0 0 25px rgba(239, 68, 68, 0.45)',
+              borderRadius: '8px',
+              padding: '10px 20px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '10px',
+              cursor: 'pointer',
+              color: '#fecaca',
+              fontFamily: 'var(--font-mono)',
+              fontSize: '12px',
+              letterSpacing: '1px',
+              animation: 'fadeIn 0.2s ease-out',
+            }}
+          >
+            <Mic className="w-4 h-4 text-[#ef4444] animate-pulse" />
+            <span style={{ fontWeight: 600 }}>AUDIO SENSORS STANDBY — CLICK TO ACTIVATE MICROPHONE</span>
+          </div>
+        )}
+
         {/* Center Display: Arc Reactor Visualizer */}
         <div style={{ padding: '8px 20px', display: 'flex', justifyContent: 'center' }}>
           <ArcReactor
-            state={assistantState}
+            state={isSpeaking ? 'speaking' : assistantState}
             onToggleVoice={toggleVoice}
-            isListening={isListening}
+            isListening={!isSpeaking && isListening}
+            isSpeaking={isSpeaking}
             isContinuousVoiceActive={isContinuousVoiceActive}
-            audioLevel={audioLevel}
+            audioLevel={isSpeaking ? 0 : audioLevel}
             currentToolName={currentToolName}
             modelName={currentActiveModel}
           />

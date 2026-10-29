@@ -82,8 +82,11 @@ class OllamaProvider(BaseLLMProvider):
             "top_p": 0.9,
         }
 
+        # Ensure model resolution points to the single user-facing model: jarvis-latest-fast
+        resolved_model = "jarvis-latest-fast" if ("jarvis" in model.lower() or model in ["qwen3:4b", "qwen2.5:1.5b", "default"] or not model) else model
+
         payload: dict[str, Any] = {
-            "model": model,
+            "model": resolved_model,
             "messages": full_messages,
             "stream": True,
             "options": options,

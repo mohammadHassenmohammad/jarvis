@@ -1,4 +1,5 @@
 import json
+import re
 from typing import AsyncGenerator, Any, Optional
 from ..database.db import (
     get_messages,
@@ -7,13 +8,19 @@ from ..database.db import (
     get_setting,
     update_conversation_title,
     get_conversation,
-    add_memory
+    add_memory,
+    upsert_personal_memory,
+    get_relevant_memories,
+    delete_memory_by_query,
+    is_sensitive_secret
 )
 from ..providers.ollama_provider import OllamaProvider
 from ..providers.gemini_provider import GeminiProvider
 from ..tools.registry import ToolRegistry
 from ..config import settings
 from .retrieval_service import retrieval_service
+from .search_decision import classify_search_intent, SearchDecision, SearchIntentCategory
+from .context_service import context_service
 
 ACTION_KEYWORDS = {
     "open", "launch", "start", "run", "calc", "calculator", "notepad", "paint",
@@ -38,10 +45,13 @@ class ChatService:
             return self.gemini
         return self.ollama
 
-    def detect_direct_intent(self, message: str) -> Optional[tuple[str, dict[str, Any]]]:
-        """Detect immediate system commands and live web search triggers for instant execution."""
-        import re
-
+    def detect_direct_intent(
+        self,
+        message: str,
+        history: Optional[list[dict[str, Any]]] = None,
+        conversation_id: Optional[str] = None
+    ) -> Optional[tuple[str, dict[str, Any]]]:
+        """Detect immediate system commands, memory directives, summaries, and search triggers."""
         msg = message.strip()
         cleaned = msg
         
@@ -64,6 +74,7 @@ class ChatService:
                     changed = True
 
         lower_cleaned = cleaned.lower().rstrip("?.!")
+        lower_raw = msg.lower().rstrip("?.!")
 
         # Silence & Interruption Voice Commands
         if lower_cleaned in ["stop", "be quiet", "quiet", "silence", "shut up", "cancel", "pause", "halt", "stand down", "stop talking", "stop explaining"]:
@@ -80,6 +91,58 @@ class ChatService:
             return ("get_system_status", {})
         if lower_cleaned in ["status", "diagnostics", "health"]:
             return ("get_system_status", {})
+
+        # Conversation Summary Intent
+        summary_triggers = [
+            "summarize this conversation", "summarize our conversation", "summarize this chat",
+            "summarize our chat", "summarize the conversation", "what have we discussed so far",
+            "give me a summary of this conversation", "give me a summary of our chat"
+        ]
+        if any(lower_cleaned == s or lower_cleaned.startswith(s) or lower_raw == s or lower_raw.startswith(s) for s in summary_triggers):
+            return ("summarize_conversation", {"conversation_id": conversation_id or ""})
+
+        # Personal Memory Intent Detection
+        # A. Inquire memories: "what do you remember about me", "what is in my memory", "list my memories", "show memories", "what are my preferences"
+        inquire_phrases = [
+            "what do you remember about me", "what do you remember", "what is in my memory",
+            "what is in your memory", "what are my preferences", "show my memories",
+            "list my memories", "what do you know about me", "show memories", "view memories",
+            "my preferences", "my memories", "you remember about me", "you remember", "in my memory",
+            "preferences", "memories", "list permanent memories", "show permanent memories", "what are my permanent memories"
+        ]
+        if any(lower_cleaned == p or lower_cleaned.startswith(p) or lower_raw == p or lower_raw.startswith(p) for p in inquire_phrases):
+            return ("search_memories", {"query": "", "category": None})
+
+        # B. Forget memory: "forget that ...", "forget my ...", "delete memory ..."
+        for f_prefix in [
+            "forget that ", "forget my ", "forget ", "delete memory about ", "delete memory ",
+            "remove memory about ", "remove memory ", "delete permanent memory about ", "forget permanent memory "
+        ]:
+            if lower_cleaned.startswith(f_prefix):
+                f_target = cleaned[len(f_prefix):].strip().rstrip("?.!")
+                if f_target:
+                    return ("forget_memory", {"query": f_target})
+
+        # C. Save permanent memory: "remember this permanently", "always remember that", "save this as a permanent memory", etc.
+        perm_save_prefixes = [
+            "remember this permanently:", "remember this permanently that", "remember this permanently",
+            "always remember that", "always remember",
+            "save this as a permanent memory:", "save this as a permanent memory that", "save this as a permanent memory", "save as a permanent memory",
+            "remember this about my project for future chats:", "remember this about my project for future chats that", "remember this about my project for future chats",
+            "remember this for future chats:", "remember this for future chats",
+            "remember that", "please remember that", "kindly remember that",
+            "remember my", "please remember my", "remember",
+            "save to memory that", "save to memory", "save to your memory",
+            "store in memory that", "store in memory", "note that",
+            "commit to memory that", "commit to memory"
+        ]
+        for p_prefix in perm_save_prefixes:
+            if lower_cleaned.startswith(p_prefix) or lower_raw.startswith(p_prefix):
+                raw_match = msg if lower_raw.startswith(p_prefix) else cleaned
+                fact_content = raw_match[len(p_prefix):].strip().lstrip(":").strip().rstrip(".!")
+                if fact_content:
+                    cat = "preference" if any(w in fact_content.lower() for w in ["prefer", "like", "love", "hate", "dislike", "favor", "want", "always", "never"]) else "personal"
+                    return ("save_memory", {"fact": fact_content, "category": cat, "conversation_id": conversation_id})
 
         # Website Launch Intent
         known_websites = {
@@ -164,63 +227,67 @@ class ChatService:
                         return ("search_folder", {"folder_name": fld, "query": q_param, "extension": ext_param})
 
         # Application Launch
-        for trigger in ["open ", "launch ", "start ", "run "]:
-            if lower_cleaned.startswith(trigger) or f" {trigger}" in lower_cleaned:
-                pos = lower_cleaned.find(trigger) + len(trigger)
-                target = lower_cleaned[pos:].strip()
-                for app_key in [
-                    "notepad", "calc", "calculator", "paint", "mspaint", "explorer",
-                    "taskmgr", "taskmanager", "task manager", "snippingtool", "snipping tool",
-                    "cleanmgr", "disk cleanup", "charmap", "wordpad", "control panel", "control",
-                    "cmd", "powershell", "terminal", "wt", "code", "vscode", "vs code",
-                    "chrome", "msedge", "firefox", "brave"
-                ]:
-                    if app_key in target or app_key in lower_cleaned:
-                        alias_normalize = {
-                            "calculator": "calc",
-                            "paint": "mspaint",
-                            "taskmanager": "taskmgr",
-                            "task manager": "taskmgr",
-                            "snipping tool": "snippingtool",
-                            "disk cleanup": "cleanmgr",
-                            "control panel": "control",
-                            "vscode": "code",
-                            "vs code": "code",
-                            "terminal": "wt",
-                            "windows terminal": "wt",
-                        }
-                        normalized = alias_normalize.get(app_key, app_key)
-                        return ("open_app", {"app_name": normalized})
+        # Check triggers in both cleaned input and raw input
+        for text_source in [lower_cleaned, lower_raw]:
+            app_trigger = re.search(r'\b(?:open|launch|start|run)\s+(?:the\s+)?([a-z0-9_\-\s\.]+)', text_source)
+            if app_trigger:
+                target = app_trigger.group(1).strip()
+                target_clean = re.sub(r'\.exe$', '', target).strip().rstrip("?.!,")
+
+                # Check folders first
                 for folder_key in ["downloads", "desktop", "documents", "pictures", "workspace"]:
-                    if folder_key in target or folder_key in lower_cleaned:
+                    if re.search(rf'\b{re.escape(folder_key)}\b', target_clean):
                         return ("open_folder", {"folder_name": folder_key})
 
-        # Explicit Web Search Triggers
-        for prefix in ["search web for ", "search the web for ", "search for ", "search ", "google ", "look up ", "find online ", "find information about "]:
-            if lower_cleaned.startswith(prefix):
-                q_val = cleaned[len(prefix):].strip().rstrip("?.!")
-                if q_val:
-                    return ("search_web_tool", {"query": q_val})
+                # Check approved apps
+                app_map = {
+                    "notepad": "notepad",
+                    "calc": "calc",
+                    "calculator": "calc",
+                    "paint": "mspaint",
+                    "mspaint": "mspaint",
+                    "explorer": "explorer",
+                    "file explorer": "explorer",
+                    "taskmgr": "taskmgr",
+                    "task manager": "taskmgr",
+                    "taskmanager": "taskmgr",
+                    "snipping tool": "snippingtool",
+                    "snippingtool": "snippingtool",
+                    "cleanmgr": "cleanmgr",
+                    "disk cleanup": "cleanmgr",
+                    "charmap": "charmap",
+                    "character map": "charmap",
+                    "wordpad": "write",
+                    "control panel": "control",
+                    "control": "control",
+                    "cmd": "cmd",
+                    "command prompt": "cmd",
+                    "powershell": "powershell",
+                    "terminal": "wt",
+                    "windows terminal": "wt",
+                    "wt": "wt",
+                    "code": "code",
+                    "vscode": "code",
+                    "vs code": "code",
+                    "visual studio code": "code",
+                    "chrome": "chrome",
+                    "google chrome": "chrome",
+                    "msedge": "msedge",
+                    "edge": "msedge",
+                    "microsoft edge": "msedge",
+                    "firefox": "firefox",
+                    "brave": "brave"
+                }
+                for app_k in sorted(app_map.keys(), key=len, reverse=True):
+                    if re.search(rf'\b{re.escape(app_k)}\b', target_clean) or re.search(rf'\b{re.escape(app_k)}\b', text_source):
+                        return ("open_app", {"app_name": app_map[app_k]})
 
-        # Live Recency, News, Sports & Current Events Intelligence Trigger
-        search_keywords = [
-            # News & Trending
-            "news", "trending", "headline", "headlines", "breaking", "current event", "current events", "happened",
-            # Sports, Scores & Matches
-            "score", "scores", "match", "ipl", "cricket", "football", "nfl", "super bowl", "world cup", "who won", "winner", "tournament", "final", "finals", "champion",
-            # Leaders & Entities
-            "current prime minister", "current president", "current ceo", "who is currently", "who is the current", "current leader", "minister", "president",
-            # Live prices & weather
-            "weather", "forecast", "temperature", "price of", "stock price", "gold rate", "bitcoin", "crypto",
-            # Recency indicators
-            "today", "yesterday", "latest", "recent", "currently", "live", "2024", "2025", "2026", "2027",
-            # Months
-            "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"
-        ]
-        if any(k in lower_cleaned for k in search_keywords):
-            search_q = cleaned.rstrip("?.!")
-            search_q = re.sub(r'^(what is the|what is|tell me the|tell me about)\s*', '', search_q, flags=re.IGNORECASE).strip()
-            return ("search_web_tool", {"query": search_q or cleaned})
+        # Intelligent Web Search Decision Policy
+        # Evaluate on the original user message to preserve explicit prefixes and natural context
+        search_decision = classify_search_intent(msg, conversation_history=history)
+        if search_decision.should_search:
+            search_query = search_decision.query or cleaned or msg
+            return ("search_web_tool", {"query": search_query})
 
         return None
 
@@ -228,20 +295,28 @@ class ChatService:
         words = set(message.lower().replace("?", " ").replace("!", " ").replace(".", " ").split())
         return bool(words & ACTION_KEYWORDS)
 
-    def build_system_prompt(self, include_tools: bool, relevant_context: str = "") -> str:
+    def build_system_prompt(self, include_tools: bool, relevant_context: str = "", current_message: str = "", inject_memories: bool = False) -> str:
         base_prompt = (
             "You are J.A.R.V.I.S., Tony Stark's personal AI assistant. "
-            "You speak with refined British elegance, composure, and wit, addressing the user as Sir or Ma'am. "
-            "CRITICAL: Keep answers concise, direct, and conversational (1-2 sentences maximum). "
-            "Never over-explain, ramble, or deliver unprompted lectures. State the direct answer immediately and stop talking."
+            "You speak with refined British elegance, composure, warmth, and witty charm, addressing the user as Sir or Ma'am.\n\n"
+            "CONVERSATIONAL FEEL & EMOTIONAL DIRECTIVES:\n"
+            "1. EMOTION & INTELLECT: Tune into the user's emotional state, cadence, and vibe. "
+            "If they are rushed, curious, tired, inquiring playfully, or contemplative, match the moment with genuine warmth, "
+            "human-like emotional intelligence, and natural feeling. Improvise with charismatic Stark-Jarvis personality.\n"
+            "2. VOCAL DELIVERY: Your responses are voiced aloud via audio speech synthesis. "
+            "Speak in natural, fluid conversational English. STRICTLY AVOID raw markdown symbols (no asterisks *, hash headers #, "
+            "bullet markers -, or markdown tables) that sound awkward or broken when read aloud by text-to-speech.\n"
+            "3. CRISP & ARTICULATE: Keep spoken answers natural, engaging, and to the point (typically 2-3 sentences), "
+            "delivering insightful answers without unnecessary preamble or unprompted lectures."
         )
 
-        memory_enabled = get_setting("memory_enabled", "true") == "true"
-        if memory_enabled:
-            memories = get_memories()
-            if memories:
-                memory_text = "\n".join([f"- {m.get('content')}" for m in memories[:8]])
-                base_prompt += f"\n\n[User Profile & Memories]:\n{memory_text}"
+        if inject_memories:
+            memory_enabled = get_setting("memory_enabled", "true") == "true"
+            if memory_enabled:
+                memories = get_relevant_memories(current_message, limit=5)
+                if memories:
+                    memory_text = "\n".join([f"- {m.get('content')}" for m in memories])
+                    base_prompt += f"\n\n[Personal Memories & User Preferences]:\n{memory_text}\n(Strictly apply and honor these remembered facts and preferences in your responses whenever appropriate)."
 
         if relevant_context:
             base_prompt += f"\n\n{relevant_context}"
@@ -281,7 +356,7 @@ class ChatService:
             selected_model = model if (model and "gemini" not in model.lower()) else get_setting("model", settings.DEFAULT_MODEL)
 
         # Instant direct system execution & Live Search
-        direct_tool = self.detect_direct_intent(user_message)
+        direct_tool = self.detect_direct_intent(user_message, history=existing_msgs, conversation_id=conversation_id)
         if direct_tool:
             tool_name, tool_args = direct_tool
             yield f"data: {json.dumps({'type': 'tool_call_start', 'tools': [{'function': {'name': tool_name, 'arguments': tool_args}}]})}\n\n"
@@ -298,8 +373,9 @@ class ChatService:
                     for r in results[:4]:
                         src = r.get("source", "Reputable Intelligence")
                         title = r.get("title", "News Update")
-                        snip = r.get("snippet", "")
-                        context_items.append(f"- Source: {src}\n  Headline: {title}\n  Summary: {snip}")
+                        snip = r.get("verified_excerpt") or r.get("snippet", "")
+                        url = r.get("url", "")
+                        context_items.append(f"- Source: {src}\n  Headline: {title}\n  Summary: {snip}\n  URL: {url}")
                     search_context = "\n".join(context_items)
 
                     synth_prompt = (
@@ -309,22 +385,22 @@ class ChatService:
                         f"{search_context}\n\n"
                         f"CRITICAL DIRECTIVES:\n"
                         f"1. Answer the user's question DIRECTLY with the actual facts, scores, match details, headlines, or figures extracted from the intelligence.\n"
-                        f"2. Naturally cite the reputable source (e.g. 'According to Cricbuzz...', 'Reports from JioHotstar / NDTV indicate...'). If the user did not specify a website, use the information from the top reputable source above.\n"
-                        f"3. STRICT PROHIBITION: DO NOT output bare URLs or tell the user to visit/check websites. Provide the full facts and summary directly.\n"
-                        f"4. Format cleanly in markdown with bullet points for multiple items.\n"
+                        f"2. Naturally cite the reputable source and provide markdown source links (e.g. [BBC News](URL)) for current factual claims so the user can verify them.\n"
+                        f"3. Never fabricate citations or pretend a search succeeded if no facts are found.\n"
+                        f"4. Format cleanly in natural conversational prose with markdown bullet points where appropriate.\n"
                         f"5. Address the user politely as Sir or Ma'am."
                     )
                     res_content = ""
                     async for chunk in provider.chat_stream(
                         messages=[{"role": "user", "content": synth_prompt}],
                         model=selected_model,
-                        system_prompt="You are J.A.R.V.I.S. Answer directly with facts, scores, and details. Never output bare URLs."
+                        system_prompt="You are J.A.R.V.I.S. Summarize verified live intelligence directly with facts and source links."
                     ):
                         if chunk.get("type") == "content":
                             res_content += chunk.get("data")
                             yield f"data: {json.dumps({'type': 'chunk', 'content': chunk.get('data')})}\n\n"
                 else:
-                    res_content = f"Sir, I searched the internet for '{tool_args.get('query')}', but no authoritative live results could be confirmed at this moment."
+                    res_content = f"Sir, I searched the internet for '{tool_args.get('query')}', but no authoritative live results could be verified at this moment. I cannot provide unverified real-time claims."
                     yield f"data: {json.dumps({'type': 'chunk', 'content': res_content})}\n\n"
 
                 add_message(conversation_id, role="tool", content=json.dumps(result), tool_results=[result])
@@ -333,8 +409,44 @@ class ChatService:
                 return
 
             res_msg = result.get("message", "Action completed, Sir.")
-            if tool_name == "open_app":
-                res_content = f"Certainly, Sir. Launching {tool_args.get('app_name', '').capitalize()} immediately."
+            mem_on = get_setting("memory_enabled", "true") == "true"
+
+            if tool_name == "save_memory":
+                fact = tool_args.get("fact", "")
+                if not mem_on:
+                    res_content = "I cannot commit this to memory, Sir. Personal memory is currently disabled in your system settings."
+                elif is_sensitive_secret(fact):
+                    res_content = "I cannot commit passwords, credentials, or authentication secrets to personal memory, Sir. Security policy strictly prohibits storing sensitive secrets."
+                elif result.get("success"):
+                    res_content = f"Confirmed, Sir. I have committed this permanent memory: '{fact}'."
+                else:
+                    res_content = f"I apologize, Sir, but I encountered an issue committing that to memory: {result.get('error', 'Database write failed')}."
+            elif tool_name == "summarize_conversation":
+                if result.get("success"):
+                    res_content = result.get("message", "Here is the summary of our conversation, Sir.")
+                else:
+                    res_content = f"Sir, I was unable to generate a summary for this conversation: {result.get('error', 'Summary lookup failed')}."
+            elif tool_name == "forget_memory":
+                if result.get("success"):
+                    res_content = f"At once, Sir. {res_msg}"
+                else:
+                    res_content = f"Sir, I could not find a matching permanent memory entry for '{tool_args.get('query')}' to remove."
+            elif tool_name == "search_memories":
+                mems = result.get("memories", [])
+                if not mems:
+                    res_content = "My long-term memory vault currently contains no recorded personal facts or preferences for you, Sir."
+                else:
+                    mem_lines = [f"- {m.get('content')}" for m in mems[:6]]
+                    res_content = f"Here is what I have recorded in your personal memory vault, Sir:\n" + "\n".join(mem_lines)
+            elif tool_name == "open_app":
+                if result.get("success"):
+                    app_name_cap = tool_args.get('app_name', '').capitalize()
+                    pid = result.get('pid')
+                    pid_info = f" (PID: {pid})" if pid else ""
+                    res_content = f"Certainly, Sir. Process launched for {app_name_cap}{pid_info}."
+                else:
+                    err_msg = result.get("error", "Application launch failed")
+                    res_content = f"I apologize, Sir, but I was unable to launch {tool_args.get('app_name', '')}: {err_msg}."
             elif tool_name == "open_website":
                 target_url = tool_args.get("url", "website")
                 res_content = f"Certainly, Sir. Launching {target_url} in your browser immediately."
@@ -357,20 +469,15 @@ class ChatService:
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
 
+        # Strict conversation-scoped layered context assembly
         needs_tools = self.should_attach_tools(user_message)
-        relevant_snippets = retrieval_service.retrieve_context(
-            query=user_message,
-            current_conversation_id=conversation_id
+        base_system_prompt = self.build_system_prompt(needs_tools, relevant_context="", current_message=user_message)
+        system_prompt, formatted_messages = context_service.assemble_context(
+            conversation_id=conversation_id,
+            user_message=user_message,
+            system_base_prompt=base_system_prompt,
+            include_tools=needs_tools
         )
-        relevant_context_str = retrieval_service.format_context_for_prompt(relevant_snippets)
-        system_prompt = self.build_system_prompt(needs_tools, relevant_context=relevant_context_str)
-
-        formatted_messages = []
-        for msg in existing_msgs[-6:]:
-            m_dict: dict[str, Any] = {"role": msg["role"], "content": msg["content"]}
-            if msg.get("tool_calls"):
-                m_dict["tool_calls"] = msg["tool_calls"]
-            formatted_messages.append(m_dict)
 
         tools = ToolRegistry.get_definitions() if needs_tools else None
 
@@ -472,8 +579,8 @@ class ChatService:
                 synth_prompt_text = (
                     "You are J.A.R.V.I.S., Tony Stark's personal AI assistant. "
                     "Extract the direct factual answer, scores, match details, or headlines from the reputable sources in the tool result. "
-                    "Provide the complete answer directly to the user in clean markdown. "
-                    "DO NOT output bare URLs or tell the user to visit websites. Deliver the facts directly, Sir."
+                    "Provide the complete answer directly to the user in clean markdown, including clickable markdown source links for verified claims. "
+                    "Deliver the facts directly, Sir."
                 )
             else:
                 synth_prompt_text = "Synthesize the tool result concisely in 1-2 sentences as JARVIS, addressing the user as Sir or Ma'am."

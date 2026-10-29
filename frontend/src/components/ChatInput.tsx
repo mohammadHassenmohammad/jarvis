@@ -135,10 +135,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     }
   };
 
+  const isMicActive = !isSpeaking && isListening;
+
   return (
     <div style={{ width: '100%', position: 'relative' }}>
       {/* Speech Recognition & Audio Visualizer Floating Toast */}
-      {isListening && (
+      {isMicActive && (
         <div
           style={{
             position: 'absolute',
@@ -209,17 +211,19 @@ export const ChatInput: React.FC<ChatInputProps> = ({
           onTouchStart={handleMicMouseDown}
           onTouchEnd={handleMicMouseUp}
           title={
-            voiceInputMode === 'push_to_talk'
+            isSpeaking
+              ? 'JARVIS is speaking. Press ESC or click INTERRUPT to speak'
+              : voiceInputMode === 'push_to_talk'
               ? 'Hold to Speak (Push-to-Talk) or Hold Spacebar'
-              : isListening
+              : isMicActive
               ? 'Click to stop recording'
               : 'Click to start voice recognition'
           }
           style={{
-            background: isListening
+            background: isMicActive
               ? 'rgba(0, 255, 170, 0.25)'
               : 'rgba(0, 240, 255, 0.1)',
-            border: isListening ? '1.5px solid #00ffaa' : '1px solid rgba(0, 240, 255, 0.3)',
+            border: isMicActive ? '1.5px solid #00ffaa' : '1px solid rgba(0, 240, 255, 0.3)',
             borderRadius: '6px',
             width: '42px',
             height: '42px',
@@ -227,13 +231,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({
             alignItems: 'center',
             justifyContent: 'center',
             cursor: 'pointer',
-            color: isListening ? '#00ffaa' : '#00f0ff',
-            boxShadow: isListening ? '0 0 15px rgba(0, 255, 170, 0.6)' : 'none',
+            color: isMicActive ? '#00ffaa' : '#00f0ff',
+            boxShadow: isMicActive ? '0 0 15px rgba(0, 255, 170, 0.6)' : 'none',
             transition: 'all 0.15s ease',
             userSelect: 'none',
           }}
         >
-          {isListening ? <MicOff className="w-5 h-5 animate-pulse" /> : <Mic className="w-5 h-5" />}
+          {isMicActive ? <MicOff className="w-5 h-5 animate-pulse" /> : <Mic className="w-5 h-5" />}
         </button>
 
         {/* PTT Mode Switcher Pill */}
@@ -269,7 +273,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={
-            isListening
+            isSpeaking
+              ? 'JARVIS is speaking... Press ESC or click INTERRUPT to speak...'
+              : isLoading
+              ? 'JARVIS is thinking...'
+              : isListening
               ? 'Listening attentively... speak naturally or say "stop"...'
               : voiceInputMode === 'push_to_talk'
               ? 'Enter command, hold Space or Mic to speak, or type...'

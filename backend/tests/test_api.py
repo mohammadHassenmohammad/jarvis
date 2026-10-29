@@ -1,7 +1,9 @@
 import pytest
 from fastapi.testclient import TestClient
 from backend.app.main import app
+from backend.app.database.db import init_db
 
+init_db()
 client = TestClient(app)
 
 def test_root():

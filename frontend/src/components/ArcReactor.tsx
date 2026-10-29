@@ -6,6 +6,7 @@ interface ArcReactorProps {
   state: AssistantState;
   onToggleVoice: () => void;
   isListening: boolean;
+  isSpeaking?: boolean;
   isContinuousVoiceActive?: boolean;
   audioLevel?: number;
   currentToolName?: string;
@@ -16,13 +17,18 @@ export const ArcReactor: React.FC<ArcReactorProps> = ({
   state,
   onToggleVoice,
   isListening,
+  isSpeaking = false,
   isContinuousVoiceActive = false,
   audioLevel = 0,
   currentToolName,
   modelName,
 }) => {
+  // If JARVIS is speaking/vocalizing, the Arc Reactor MUST reflect SPEAKING state, never listening!
+  const effectiveState = (isSpeaking || state === 'speaking') ? 'speaking' : state;
+  const isActuallyListening = !isSpeaking && isListening && effectiveState !== 'speaking';
+
   const getStateInfo = () => {
-    switch (state) {
+    switch (effectiveState) {
       case 'wake_word_monitoring':
         return {
           title: 'WAKE-WORD PROTOCOL ACTIVE',
@@ -74,7 +80,7 @@ export const ArcReactor: React.FC<ArcReactorProps> = ({
       case 'speaking':
         return {
           title: 'AUDIO SYNTHESIZER',
-          status: 'SPEAKING VOCAL RESPONSE',
+          status: 'SPEAKING VOCAL RESPONSE // MIC MUTED',
           color: '#00f0ff',
           glowClass: 'speaking-anim',
           icon: <Volume2 className="w-8 h-8 text-[#00f0ff] animate-bounce" />,
@@ -122,8 +128,8 @@ export const ArcReactor: React.FC<ArcReactorProps> = ({
       {/* Reactor Housing */}
       <div
         onClick={onToggleVoice}
-        title={isListening ? 'Click to stop listening' : 'Click to speak to JARVIS'}
-        className={`relative cursor-pointer transition-all duration-150 ${info.glowClass}`}
+        title={isSpeaking ? 'JARVIS is speaking (ESC to interrupt)' : isActuallyListening ? 'Click to stop listening' : 'Click to speak to JARVIS'}
+        className={`relative cursor-pointer ${info.glowClass}`}
         style={{
           width: '180px',
           height: '180px',
@@ -133,10 +139,11 @@ export const ArcReactor: React.FC<ArcReactorProps> = ({
           justifyContent: 'center',
           background: 'radial-gradient(circle, rgba(10,25,50,0.85) 0%, rgba(5,10,20,0.95) 70%, #030712 100%)',
           border: `2px solid ${info.color}`,
-          transform: isListening ? `scale(${1 + Math.min(0.2, audioLevel * 0.25)})` : 'none',
-          boxShadow: isListening
-            ? `0 0 ${25 + audioLevel * 45}px #00ffaa, inset 0 0 ${20 + audioLevel * 30}px #00ffaa`
+          transform: isActuallyListening ? `scale(${1 + Math.min(0.12, audioLevel * 0.15)})` : 'none',
+          boxShadow: isActuallyListening
+            ? `0 0 ${22 + audioLevel * 30}px #00ffaa, inset 0 0 ${16 + audioLevel * 20}px #00ffaa`
             : `0 0 25px ${info.color}40, inset 0 0 20px ${info.color}30`,
+          transition: 'transform 0.22s cubic-bezier(0.2, 0, 0.2, 1), box-shadow 0.22s ease-out, border-color 0.3s ease',
         }}
       >
         {/* Outer Rotating Segment Ring */}
